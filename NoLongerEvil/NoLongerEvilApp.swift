@@ -9,9 +9,14 @@ import SwiftUI
 
 @main
 struct NoLongerEvilApp: App {
+    private var settings = AppSettings()
+
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            RootView()
+                .environmentObject(settings)
+                .environmentObject(AppStore(settings: settings))
         }
     }
 }
+

@@ -1,0 +1,35 @@
+# Xcode user data
+*.xcuserstate
+xcuserdata/
+xcshareddata/swiftpm/
+*.xccheckout
+*.xcscmblueprint
+
+# Build products
+build/
+DerivedData/
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# CocoaPods (not used, using SPM)
+Pods/
+Podfile.lock
+
+# Carthage (not used)
+Carthage/
+
+# Swift Package Manager
+.swiftpm/
+Package.resolved
+.build/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Temporary files
+*.swp
+*.swo
+*~
