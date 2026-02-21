@@ -1,6 +1,6 @@
 # NoLongerEvil iOS
 
-This is a SwiftUI iOS test client for the NoLongerEvil hosted service. It is a prototype and not a production ready app.
+This is a SwiftUI iOS test client for the NoLongerEvil hosted service. It is a prototype and not a production ready app. I do not have an active Apple developer account right now so this isn't published as a build anywhere and I don't think I can have GitHub action build one without a paid developer account. 
 
 I know the mode selector works, changing the set point works however, I haven't tested the set points in auto mode yet. The fan control should work, no timere yet. 
 
