@@ -97,6 +97,13 @@ class ThermostatState: ObservableObject, Identifiable {
     @Published var away: Bool = false
     @Published var isAvailable: Bool = true
     @Published var temperatureScale: String = "F"
+    @Published var currentHumidity: Double?
+    @Published var outsideTemperature: Double?
+    @Published var postalCode: String?
+    @Published var latitude: Double?
+    @Published var longitude: Double?
+    @Published var outsideTempUpdatedAt: Date?
+    @Published var geocodeUpdatedAt: Date?
     @Published var canHeat: Bool = true
     @Published var canCool: Bool = true
     @Published var hasFan: Bool = false
@@ -126,6 +133,11 @@ class ThermostatState: ObservableObject, Identifiable {
             hvacMode = (sharedValue["target_temperature_type"] as? String) ?? "off"
             canHeat = (sharedValue["can_heat"] as? Bool) ?? true
             canCool = (sharedValue["can_cool"] as? Bool) ?? true
+            if let h = sharedValue["current_humidity"] as? Double {
+                currentHumidity = h
+            } else if let h = sharedValue["current_humidity"] as? Int {
+                currentHumidity = Double(h)
+            }
             // Thermostat's friendly name lives in shared state
             if let sharedName = sharedValue["name"] as? String, !sharedName.isEmpty {
                 name = sharedName
@@ -138,6 +150,16 @@ class ThermostatState: ObservableObject, Identifiable {
             temperatureScale = (deviceValue["temperature_scale"] as? String) ?? "F"
             hasFan = (deviceValue["has_fan"] as? Bool) ?? false
             hasEmerHeat = (deviceValue["has_emer_heat"] as? Bool) ?? false
+            if let h = deviceValue["current_humidity"] as? Double {
+                currentHumidity = h
+            } else if let h = deviceValue["current_humidity"] as? Int {
+                currentHumidity = Double(h)
+            }
+            if let pc = deviceValue["postal_code"] as? String { postalCode = pc }
+            if let loc = deviceValue["location"] as? [String: Any] {
+                latitude = loc["latitude"] as? Double ?? latitude
+                longitude = loc["longitude"] as? Double ?? longitude
+            }
 
             // Fan is active if fan_timer_timeout > 0
             let fanTimeout = deviceValue["fan_timer_timeout"] as? Int ?? 0
@@ -150,6 +172,11 @@ class ThermostatState: ObservableObject, Identifiable {
                let structDict = val as? [String: Any],
                let structValue = structDict["value"] as? [String: Any] {
                 away = (structValue["away"] as? Bool) ?? false
+                if let pc = structValue["postal_code"] as? String { postalCode = pc }
+                if let loc = structValue["location"] as? [String: Any] {
+                    latitude = loc["latitude"] as? Double ?? latitude
+                    longitude = loc["longitude"] as? Double ?? longitude
+                }
                 // Use structure name as fallback if thermostat has no name
                 if name == nil, let structName = structValue["name"] as? String, !structName.isEmpty {
                     name = structName
@@ -170,6 +197,7 @@ class AppStore: ObservableObject {
 
     let settings: AppSettings
     private var pollTimer: Timer?
+    private let weatherUserAgent = "NoLongerEvil/1.0 (nolongerevil.com)"
 
     init(settings: AppSettings) {
         self.settings = settings
@@ -233,6 +261,7 @@ class AppStore: ObservableObject {
                     device.update(from: parsedState)
                     device.isAvailable = true
                 }
+                await refreshOutsideTempIfNeeded(for: device)
             }
         } catch {
             await MainActor.run { device.isAvailable = false }
@@ -356,6 +385,53 @@ class AppStore: ObservableObject {
             throw AppError("Request failed (HTTP \(http.statusCode))")
         }
     }
+
+    // MARK: Outside Weather (NWS)
+
+    func refreshOutsideTempIfNeeded(for device: ThermostatState) async {
+        if (device.latitude == nil || device.longitude == nil),
+           let zip = device.postalCode {
+            await resolveZipIfNeeded(device: device, postalCode: zip)
+        }
+        guard let lat = device.latitude, let lon = device.longitude else { return }
+        let now = Date()
+        if let last = device.outsideTempUpdatedAt, now.timeIntervalSince(last) < 900 {
+            return
+        }
+        do {
+            if let temp = try await OpenMeteoService.fetchOutsideTemp(
+                lat: lat,
+                lon: lon,
+                scale: device.temperatureScale
+            ) {
+                await MainActor.run {
+                    device.outsideTemperature = temp
+                    device.outsideTempUpdatedAt = Date()
+                }
+            }
+        } catch {
+            // Ignore transient weather errors; keep last known value
+        }
+    }
+
+    func resolveZipIfNeeded(device: ThermostatState, postalCode: String) async {
+        let now = Date()
+        if let last = device.geocodeUpdatedAt, now.timeIntervalSince(last) < 86_400 {
+            return
+        }
+        let cleaned = postalCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            if let coord = try await ZippopotamService.lookupPostalCode(cleaned, userAgent: weatherUserAgent) {
+                await MainActor.run {
+                    device.latitude = coord.lat
+                    device.longitude = coord.lon
+                    device.geocodeUpdatedAt = Date()
+                }
+            }
+        } catch {
+            await MainActor.run { device.geocodeUpdatedAt = Date() }
+        }
+    }
 }
 
 struct AppError: LocalizedError {
@@ -366,6 +442,67 @@ struct AppError: LocalizedError {
 
 extension String {
     var trimmed: String { trimmingCharacters(in: .whitespacesAndNewlines) }
+}
+
+// MARK: - NWS Weather
+
+enum ZippopotamService {
+    struct Response: Decodable {
+        struct Place: Decodable {
+            let latitude: String
+            let longitude: String
+        }
+        let places: [Place]
+    }
+
+    static func lookupPostalCode(_ postalCode: String, userAgent: String) async throws -> (lat: Double, lon: Double)? {
+        let zip = postalCode.split(separator: " ").first.map(String.init) ?? postalCode
+        guard !zip.isEmpty else { return nil }
+        let url = URL(string: "https://api.zippopotam.us/us/\(zip)")!
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        if let http = resp as? HTTPURLResponse, http.statusCode >= 400 {
+            throw AppError("ZIP lookup failed (HTTP \(http.statusCode))")
+        }
+        let decoded = try JSONDecoder().decode(Response.self, from: data)
+        guard let first = decoded.places.first,
+              let lat = Double(first.latitude),
+              let lon = Double(first.longitude) else { return nil }
+        return (lat: lat, lon: lon)
+    }
+}
+
+enum OpenMeteoService {
+    struct ForecastResponse: Decodable {
+        struct Current: Decodable {
+            let temperature_2m: Double?
+        }
+        struct Units: Decodable {
+            let temperature_2m: String?
+        }
+        let current: Current?
+        let current_units: Units?
+    }
+
+    static func fetchOutsideTemp(lat: Double, lon: Double, scale: String) async throws -> Double? {
+        let unit = scale.uppercased() == "F" ? "fahrenheit" : "celsius"
+        var comps = URLComponents(string: "https://api.open-meteo.com/v1/forecast")!
+        comps.queryItems = [
+            URLQueryItem(name: "latitude", value: String(lat)),
+            URLQueryItem(name: "longitude", value: String(lon)),
+            URLQueryItem(name: "current", value: "temperature_2m"),
+            URLQueryItem(name: "temperature_unit", value: unit)
+        ]
+        guard let url = comps.url else { return nil }
+        let (data, resp) = try await URLSession.shared.data(from: url)
+        if let http = resp as? HTTPURLResponse, http.statusCode >= 400 {
+            throw AppError("Weather request failed (HTTP \(http.statusCode))")
+        }
+        let decoded = try JSONDecoder().decode(ForecastResponse.self, from: data)
+        guard let temp = decoded.current?.temperature_2m else { return nil }
+        return temp
+    }
 }
 
 // MARK: - Temperature Helpers
@@ -450,7 +587,12 @@ struct DeviceListView: View {
                     emptyState
                 } else {
                     ForEach(store.devices) { state in
-                        DeviceCard(state: state)
+                        NavigationLink {
+                            DeviceDetailView(state: state)
+                        } label: {
+                            DeviceSummaryCard(state: state)
+                        }
+                        .buttonStyle(.plain)
                     }
                 }
 
@@ -493,12 +635,10 @@ struct DeviceListView: View {
     }
 }
 
-// MARK: - Device Card
+// MARK: - Device Summary Card
 
-struct DeviceCard: View {
+struct DeviceSummaryCard: View {
     @ObservedObject var state: ThermostatState
-    @EnvironmentObject var store: AppStore
-    @State private var feedback: String?
 
     var scale: String { state.temperatureScale }
     var mk: String { state.modeKey }
@@ -513,131 +653,40 @@ struct DeviceCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            headerRow
-            Divider().padding(.horizontal, 4).opacity(0.5)
-            climateRow.padding(.horizontal, 16).padding(.top, 14).padding(.bottom, 4)
-            controlRow.padding(.horizontal, 16).padding(.top, 10).padding(.bottom, 14)
-            if let fb = feedback {
-                Text(fb).font(.caption2).foregroundStyle(.secondary)
-                    .padding(.horizontal, 16).padding(.bottom, 8)
-            }
-        }
-        .background(Color(.systemBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18)
-            .stroke(glowColor?.opacity(0.4) ?? Color.clear, lineWidth: 1.5))
-        .shadow(color: (glowColor ?? .black).opacity(0.1), radius: 12, x: 0, y: 4)
-    }
-
-    // MARK: Header Row
-
-    var headerRow: some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(spacing: 14) {
             ZStack {
-                Circle().fill(state.isAvailable ? Color.nleGreen.opacity(0.2) : .clear)
-                    .frame(width: 14, height: 14)
-                Circle().fill(state.isAvailable ? Color.nleGreen : Color.gray.opacity(0.4))
-                    .frame(width: 8, height: 8)
-            }.padding(.top, 4)
+                Circle().fill(glowColor?.opacity(0.18) ?? Color(.secondarySystemBackground))
+                    .frame(width: 62, height: 62)
+                Text(displayTemp(state.currentTemperature, scale: scale))
+                    .font(.system(size: 22, weight: .bold, design: .rounded)).monospacedDigit()
+            }
 
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(state.name ?? state.serial)
-                    .font(.system(.body).weight(.semibold))
+                    .font(.system(.headline, design: .rounded)).lineLimit(1)
                 Text(state.serial)
                     .font(.system(.caption2, design: .monospaced)).foregroundStyle(.tertiary)
-            }
-
-            Spacer()
-
-            if state.away {
-                Label("Away", systemImage: "house.slash.fill")
-                    .font(.caption2.weight(.semibold)).foregroundStyle(.orange)
-                    .padding(.horizontal, 8).padding(.vertical, 4)
-                    .background(Color.orange.opacity(0.12), in: Capsule())
-            }
-        }
-        .padding(.horizontal, 16).padding(.top, 16).padding(.bottom, 14)
-    }
-
-    // MARK: Climate Row
-
-    var climateRow: some View {
-        HStack(alignment: .center) {
-            HStack(alignment: .lastTextBaseline, spacing: 2) {
-                Text(displayTemp(state.currentTemperature, scale: scale))
-                    .font(.system(size: 60, weight: .bold, design: .rounded)).monospacedDigit()
-                    .contentTransition(.numericText())
-                    .animation(.easeInOut(duration: 0.3), value: state.currentTemperature)
-                Text("°\(scale)").font(.system(size: 18, weight: .medium)).foregroundStyle(.tertiary)
-                    .padding(.bottom, 10)
-            }
-            Spacer()
-            targetSection
-        }
-    }
-
-    @ViewBuilder
-    var targetSection: some View {
-        if mk == "off" || mk == "emergency" {
-            VStack(spacing: 4) {
-                Image(systemName: mk == "emergency" ? "exclamationmark.triangle.fill" : "powersleep")
-                    .font(.system(size: 24)).foregroundStyle(.secondary)
-                Text(mk == "off" ? "Off" : "Emergency Heat")
-                    .font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
-            }
-        } else if mk == "auto" {
-            rangeControls
-        } else {
-            singleTargetControls
-        }
-    }
-
-    var singleTargetControls: some View {
-        HStack(spacing: 16) {
-            CircleBtn(symbol: "minus") { adjustSingle(delta: -1) }
-            VStack(spacing: 2) {
-                Text("Target").font(.caption2.weight(.semibold)).foregroundStyle(.tertiary)
-                    .textCase(.uppercase).tracking(0.5)
-                Text(displayTemp(state.targetTemperature, scale: scale))
-                    .font(.system(size: 28, weight: .bold, design: .rounded)).monospacedDigit()
-                    .contentTransition(.numericText())
-                    .animation(.easeInOut(duration: 0.2), value: state.targetTemperature)
-                RoundedRectangle(cornerRadius: 2).fill(modeAccentColor)
-                    .frame(width: 28, height: 3)
-            }
-            CircleBtn(symbol: "plus") { adjustSingle(delta: 1) }
-        }
-    }
-
-    var rangeControls: some View {
-        HStack(spacing: 8) {
-            VStack(spacing: 2) {
-                Text("Low").font(.caption2.weight(.semibold)).foregroundStyle(.tertiary)
-                    .textCase(.uppercase).tracking(0.5)
-                HStack(spacing: 5) {
-                    SmallCircleBtn(symbol: "minus") { adjustRange(field: "low", delta: -1) }
-                    Text(displayTemp(state.targetTemperatureLow, scale: scale))
-                        .font(.system(size: 18, weight: .bold, design: .rounded)).monospacedDigit()
-                        .contentTransition(.numericText())
-                        .animation(.easeInOut(duration: 0.2), value: state.targetTemperatureLow)
-                    SmallCircleBtn(symbol: "plus") { adjustRange(field: "low", delta: 1) }
+                HStack(spacing: 6) {
+                    Text(modeLabel).font(.caption.weight(.semibold))
+                        .foregroundStyle(glowColor ?? .secondary)
+                    if state.away {
+                        Text("Away").font(.caption2.weight(.semibold)).foregroundStyle(.orange)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Color.orange.opacity(0.12), in: Capsule())
+                    }
                 }
             }
-            Text("–").foregroundStyle(.tertiary).font(.callout)
-            VStack(spacing: 2) {
-                Text("High").font(.caption2.weight(.semibold)).foregroundStyle(.tertiary)
-                    .textCase(.uppercase).tracking(0.5)
-                HStack(spacing: 5) {
-                    SmallCircleBtn(symbol: "minus") { adjustRange(field: "high", delta: -1) }
-                    Text(displayTemp(state.targetTemperatureHigh, scale: scale))
-                        .font(.system(size: 18, weight: .bold, design: .rounded)).monospacedDigit()
-                        .contentTransition(.numericText())
-                        .animation(.easeInOut(duration: 0.2), value: state.targetTemperatureHigh)
-                    SmallCircleBtn(symbol: "plus") { adjustRange(field: "high", delta: 1) }
-                }
-            }
+            Spacer()
+            Image(systemName: "chevron.right")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.tertiary)
         }
+        .padding(16)
+        .background(Color(.systemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16)
+            .stroke(glowColor?.opacity(0.35) ?? Color.clear, lineWidth: 1.2))
+        .shadow(color: (glowColor ?? .black).opacity(0.08), radius: 10, x: 0, y: 4)
     }
 
     var modeAccentColor: Color {
@@ -649,105 +698,268 @@ struct DeviceCard: View {
         }
     }
 
-    // MARK: Control Row
+    // MARK: Helpers
 
-    var controlRow: some View {
-        VStack(spacing: 10) {
-            Divider().opacity(0.5)
-            HStack(spacing: 8) {
-                modeSegment
-                Spacer(minLength: 4)
-                if state.hasFan { fanToggle }
-                ecoToggle
-            }
+    struct ModeOption { let label: String; let nestMode: String; let color: Color }
+
+    func buildModes() -> [ModeOption] {
+        var modes: [ModeOption] = []
+        if state.canHeat { modes.append(.init(label: "Heat", nestMode: "heat", color: .nleHeat)) }
+        if state.canCool { modes.append(.init(label: "Cool", nestMode: "cool", color: .nleCool)) }
+        if state.canHeat && state.canCool {
+            modes.append(.init(label: "Auto", nestMode: "range", color: .nleAuto))
         }
+        if state.hasEmerHeat { modes.append(.init(label: "Emer", nestMode: "emergency", color: .red)) }
+        modes.append(.init(label: "Off", nestMode: "off", color: .secondary))
+        return modes
     }
 
-    var modeSegment: some View {
-        let modes = buildModes()
-        return HStack(spacing: 2) {
-            ForEach(modes, id: \.label) { m in
-                Button {
+    func isActive(_ nestMode: String) -> Bool {
+        let curr = state.hvacMode.lowercased()
+        let n = nestMode.lowercased()
+        if n == "range" { return curr == "range" || curr == "heat-cool" }
+        return curr == n
+    }
+    var modeLabel: String {
+        switch mk {
+        case "heat": return "Heat"
+        case "cool": return "Cool"
+        case "auto": return "Auto"
+        case "emergency": return "Emer"
+        default: return "Off"
+        }
+    }
+}
+
+// MARK: - Device Detail (Nest-style)
+
+struct DeviceDetailView: View {
+    @ObservedObject var state: ThermostatState
+    @EnvironmentObject var store: AppStore
+    @Environment(\.dismiss) var dismiss
+    @State private var feedback: String?
+    @State private var showModePicker = false
+    @State private var showFanPicker = false
+
+    var scale: String { state.temperatureScale }
+    var mk: String { state.modeKey }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 22) {
+                header
+                ThermostatDial(
+                    state: state,
+                    scale: scale,
+                    modeColor: modeAccentColor,
+                    backgroundColor: modeBackground
+                )
+                    .padding(.top, 8)
+
+                if mk == "auto" {
+                    rangeControls
+                } else if mk == "off" || mk == "emergency" {
+                    offState
+                } else {
+                    singleTargetControls
+                }
+
+                infoRows
+
+                bottomControls
+
+                if let fb = feedback {
+                    Text(fb).font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.bottom, 24)
+        }
+        .background(modeBackground.ignoresSafeArea())
+        .navigationBarTitleDisplayMode(.inline)
+        .navigationBarBackButtonHidden(true)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button { dismiss() } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 15, weight: .semibold))
+                }
+            }
+        }
+        .sheet(isPresented: $showModePicker) {
+            ModePickerSheet(
+                title: "Mode",
+                options: buildModes(),
+                isActive: isActive(_:),
+                onSelect: { mode in
                     Task {
-                        if let err = await store.setMode(device: state, mode: m.nestMode) {
+                        if let err = await store.setMode(device: state, mode: mode) {
                             showFeedback("✗ \(err)")
                         } else {
-                            showFeedback("→ \(m.label)")
+                            showFeedback("→ \(mode)")
                         }
                     }
-                } label: {
-                    Text(m.label).font(.system(size: 11, weight: .bold))
-                        .padding(.horizontal, 9).padding(.vertical, 7)
-                        .background(
-                            isActive(m.nestMode) ? m.color.opacity(0.15) : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 8)
-                        )
-                        .foregroundStyle(isActive(m.nestMode) ? m.color : Color.secondary)
                 }
-                .buttonStyle(.plain)
-            }
-        }
-        .padding(3)
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
-    }
-
-    var ecoToggle: some View {
-        Button {
-            Task {
-                if let err = await store.setAway(device: state, away: !state.away) {
-                    showFeedback("✗ \(err)")
-                } else {
-                    showFeedback(state.away ? "Eco off" : "Eco on")
-                }
-            }
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "leaf.fill").font(.system(size: 10))
-                Text("Eco").font(.system(size: 11, weight: .bold))
-            }
-            .padding(.horizontal, 10).padding(.vertical, 7)
-            .background(
-                state.away ? Color.nleEco.opacity(0.15) : Color(.secondarySystemBackground),
-                in: RoundedRectangle(cornerRadius: 10)
             )
-            .foregroundStyle(state.away ? Color.nleEco : Color.secondary)
-            .overlay(RoundedRectangle(cornerRadius: 10)
-                .stroke(state.away ? Color.nleEco.opacity(0.4) : Color.clear, lineWidth: 1))
+            .presentationDetents([.height(150)])
+            .presentationDragIndicator(.visible)
+            .presentationBackground(.ultraThinMaterial)
         }
-        .buttonStyle(.plain)
-    }
-
-    var fanToggle: some View {
-        HStack(spacing: 2) {
-            ForEach([("Auto", false), ("On", true)], id: \.0) { label, isOn in
-                Button {
+        .sheet(isPresented: $showFanPicker) {
+            FanPickerSheet(
+                isOn: state.fanTimerActive,
+                onSelect: { isOn in
                     Task {
                         if let err = await store.setFan(device: state, on: isOn) {
                             showFeedback("✗ \(err)")
                         } else {
-                            showFeedback("Fan \(label)")
+                            showFeedback("Fan \(isOn ? "On" : "Auto")")
                         }
                     }
-                } label: {
-                    HStack(spacing: 3) {
-                        if isOn { Image(systemName: "fan.fill").font(.system(size: 9)) }
-                        Text(label).font(.system(size: 11, weight: .bold))
-                    }
-                    .padding(.horizontal, 9).padding(.vertical, 7)
-                    .background(
-                        state.fanTimerActive == isOn ? Color.nleGreen.opacity(0.15) : Color.clear,
-                        in: RoundedRectangle(cornerRadius: 8)
-                    )
-                    .foregroundStyle(state.fanTimerActive == isOn ? Color.nleGreen : Color.secondary)
                 }
-                .buttonStyle(.plain)
-            }
+            )
+            .presentationDetents([.height(140)])
+            .presentationDragIndicator(.visible)
+            .presentationBackground(.ultraThinMaterial)
         }
-        .padding(3)
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
     }
 
-    // MARK: Helpers
+    var header: some View {
+        VStack(spacing: 6) {
+            Text(state.name ?? state.serial)
+                .font(.system(.title2, design: .rounded).weight(.semibold))
+                .lineLimit(1)
+                .foregroundStyle(.white)
+            Text(state.serial)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.7))
+            if state.away {
+                Text("Away / Eco")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 10).padding(.vertical, 4)
+                    .background(Color.white.opacity(0.18), in: Capsule())
+            }
+        }
+    }
+
+    var singleTargetControls: some View {
+        HStack(spacing: 18) {
+            CircleBtn(symbol: "minus") { adjustSingle(delta: -1) }
+            VStack(spacing: 2) {
+                Text("Target").font(.caption2.weight(.semibold)).foregroundStyle(.white.opacity(0.7))
+                    .textCase(.uppercase).tracking(0.6)
+                RoundedRectangle(cornerRadius: 2).fill(modeAccentColor)
+                    .frame(width: 30, height: 3)
+            }
+            CircleBtn(symbol: "plus") { adjustSingle(delta: 1) }
+        }
+    }
+
+    var rangeControls: some View {
+        HStack(spacing: 16) {
+            rangeColumn(title: "Low", value: state.targetTemperatureLow, field: "low")
+            Text("–").foregroundStyle(.tertiary).font(.callout)
+            rangeColumn(title: "High", value: state.targetTemperatureHigh, field: "high")
+        }
+    }
+
+    func rangeColumn(title: String, value: Double?, field: String) -> some View {
+        VStack(spacing: 4) {
+            Text(title).font(.caption2.weight(.semibold)).foregroundStyle(.white.opacity(0.7))
+                .textCase(.uppercase).tracking(0.6)
+            HStack(spacing: 6) {
+                SmallCircleBtn(symbol: "minus") { adjustRange(field: field, delta: -1) }
+                Text(displayTemp(value, scale: scale))
+                    .font(.system(size: 22, weight: .bold, design: .rounded)).monospacedDigit()
+                    .contentTransition(.numericText())
+                    .animation(.easeInOut(duration: 0.2), value: value)
+                SmallCircleBtn(symbol: "plus") { adjustRange(field: field, delta: 1) }
+            }
+        }
+    }
+
+    var offState: some View {
+        VStack(spacing: 6) {
+            Image(systemName: mk == "emergency" ? "exclamationmark.triangle.fill" : "powersleep")
+                .font(.system(size: 26)).foregroundStyle(.secondary)
+            Text(mk == "off" ? "Off" : "Emergency Heat")
+                .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+        }
+    }
+
+    var infoRows: some View {
+        VStack(spacing: 10) {
+            InfoRow(label: "Inside Humidity", value: humidityDisplay)
+            InfoRow(label: "Outside Temp.", value: outsideTempDisplay)
+        }
+    }
+
+    var bottomControls: some View {
+        VStack(spacing: 10) {
+            Divider().opacity(0.25)
+            HStack(spacing: 28) {
+                ControlIconButton(
+                    symbol: "dial.medium",
+                    label: "Mode",
+                    isActive: true
+                ) { showModePicker = true }
+
+                ControlIconButton(
+                    symbol: "leaf.fill",
+                    label: "Eco",
+                    isActive: state.away
+                ) {
+                    Task {
+                        if let err = await store.setAway(device: state, away: !state.away) {
+                            showFeedback("✗ \(err)")
+                        } else {
+                            showFeedback(state.away ? "Eco off" : "Eco on")
+                        }
+                    }
+                }
+
+                if state.hasFan {
+                    ControlIconButton(
+                        symbol: "fan.fill",
+                        label: "Fan",
+                        isActive: state.fanTimerActive
+                    ) { showFanPicker = true }
+                }
+            }
+            .padding(.vertical, 8)
+        }
+    }
+
+    var humidityDisplay: String {
+        guard let h = state.currentHumidity else { return "--" }
+        return "\(Int(round(h)))%"
+    }
+
+    var outsideTempDisplay: String {
+        guard let t = state.outsideTemperature else { return "--" }
+        let r = round(t)
+        return "\(Int(r))°"
+    }
+
+    var modeAccentColor: Color {
+        switch mk {
+        case "heat": return .nleHeat
+        case "cool": return .nleCool
+        case "auto": return .nleAuto
+        default: return .white.opacity(0.7)
+        }
+    }
+
+    var modeBackground: Color {
+        switch mk {
+        case "heat": return Color(red: 0.94, green: 0.42, blue: 0.14)
+        case "cool": return Color(red: 0.12, green: 0.53, blue: 0.98)
+        case "auto": return Color(red: 0.33, green: 0.25, blue: 0.95)
+        case "emergency": return Color(red: 0.62, green: 0.10, blue: 0.14)
+        default: return Color(red: 0.14, green: 0.16, blue: 0.20)
+        }
+    }
 
     struct ModeOption { let label: String; let nestMode: String; let color: Color }
 
@@ -776,7 +988,7 @@ struct DeviceCard: View {
         let display = scale == "F" ? round(c2f(base)) : (round(base * 2) / 2)
         let newDisplay = display + Double(delta) * step
         let newC = scale == "F" ? f2c(newDisplay) : newDisplay
-        state.targetTemperature = newC  // optimistic update
+        state.targetTemperature = newC
         Task { await store.setTemperature(device: state, celsius: newC) }
     }
 
@@ -796,6 +1008,365 @@ struct DeviceCard: View {
     func showFeedback(_ msg: String) {
         feedback = msg
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { feedback = nil }
+    }
+}
+
+struct ThermostatDial: View {
+    @ObservedObject var state: ThermostatState
+    let scale: String
+    let modeColor: Color
+    let backgroundColor: Color
+
+    var mk: String { state.modeKey }
+
+    var body: some View {
+        GeometryReader { geo in
+            let size = min(geo.size.width, 300)
+            let radius = size * 0.48
+            let arcRadius = radius - 8
+            ZStack {
+                Circle()
+                    .fill(LinearGradient(
+                        colors: [Color.white.opacity(0.12), Color.white.opacity(0.04)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ))
+                    .frame(width: size, height: size)
+                    .shadow(color: Color.black.opacity(0.25), radius: 18, x: 0, y: 12)
+
+                DialTicks(radius: radius, color: Color.white.opacity(0.35), tickCount: 240)
+
+                Circle()
+                    .stroke(backgroundColor.opacity(0.45), lineWidth: 10)
+                    .frame(width: size * 0.92, height: size * 0.92)
+
+                DialArc(start: arcStartAngle, end: arcEndAngle)
+                    .stroke(Color.white.opacity(0.18), style: StrokeStyle(lineWidth: 14, lineCap: .butt))
+                    .frame(width: arcRadius * 2, height: arcRadius * 2)
+
+                DialMarker(
+                    radius: arcRadius,
+                    angle: angleForSetpoint,
+                    color: Color.white
+                )
+
+                DialMarker(
+                    radius: arcRadius,
+                    angle: angleForCurrent,
+                    color: Color.white.opacity(0.7),
+                    length: 12
+                )
+
+                currentTempLabel(size: size, radius: arcRadius * 0.98)
+
+                VStack(spacing: 6) {
+                    Text(centerDisplay)
+                        .font(.system(size: 64, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                        .contentTransition(.numericText())
+                        .foregroundStyle(.white)
+                    Text("°\(scale)")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.7))
+
+                    Text(statusLine)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.85))
+                }
+            }
+            .frame(width: size, height: size)
+            .frame(maxWidth: .infinity)
+        }
+        .frame(height: 300)
+    }
+
+    var statusLine: String {
+        if mk == "auto" {
+            let low = displayTemp(state.targetTemperatureLow, scale: scale)
+            let high = displayTemp(state.targetTemperatureHigh, scale: scale)
+            return "Auto"
+        }
+        if mk == "off" { return "Off" }
+        if mk == "emergency" { return "Emergency Heat" }
+        return modeLabel
+    }
+
+    var modeLabel: String {
+        switch mk {
+        case "heat": return "Heat"
+        case "cool": return "Cool"
+        case "auto": return "Auto"
+        default: return "Off"
+        }
+    }
+
+    var centerDisplay: String {
+        if mk == "auto" {
+            let low = displayTemp(state.targetTemperatureLow, scale: scale)
+            let high = displayTemp(state.targetTemperatureHigh, scale: scale)
+            return "\(low)–\(high)"
+        }
+        return displayTemp(state.targetTemperature, scale: scale)
+    }
+
+    var angleForSetpoint: Angle {
+        let temp = setpointValue
+        return angle(for: temp)
+    }
+
+    var angleForCurrent: Angle {
+        angle(for: state.currentTemperature)
+    }
+
+    var setpointValue: Double? {
+        if mk == "auto" {
+            if let low = state.targetTemperatureLow, let high = state.targetTemperatureHigh {
+                return (low + high) / 2
+            }
+            return state.targetTemperatureLow ?? state.targetTemperatureHigh
+        }
+        return state.targetTemperature
+    }
+
+    func angle(for celsius: Double?) -> Angle {
+        guard let c = celsius else { return .degrees(-120) }
+        let f = scale == "F" ? c2f(c) : c
+        let range = tempRange
+        let t = min(max(f, range.min), range.max)
+        let pct = (t - range.min) / (range.max - range.min)
+        return .degrees(-120 + pct * 240)
+    }
+
+    var tempRange: (min: Double, max: Double) {
+        if scale == "F" { return (min: 50, max: 90) }
+        return (min: 10, max: 32)
+    }
+
+    var arcStartAngle: Angle {
+        let a = angleForSetpoint.degrees
+        let b = angleForCurrent.degrees
+        return .degrees(min(a, b))
+    }
+
+    var arcEndAngle: Angle {
+        let a = angleForSetpoint.degrees
+        let b = angleForCurrent.degrees
+        return .degrees(max(a, b))
+    }
+
+    func currentTempLabel(size: CGFloat, radius: CGFloat) -> some View {
+        let angle = angleForCurrent
+        let angleRad = angle.degrees * .pi / 180
+        let center = CGPoint(x: size / 2, y: size / 2)
+        let px = center.x + radius * sin(angleRad)
+        let py = center.y - radius * cos(angleRad)
+        let tx = cos(angleRad)
+        let ty = sin(angleRad)
+        let offset: CGFloat = 16
+        let labelPoint = CGPoint(x: px + tx * offset, y: py + ty * offset)
+
+        return Text(displayTemp(state.currentTemperature, scale: scale))
+            .font(.system(size: 12, weight: .semibold, design: .rounded))
+            .foregroundStyle(.white.opacity(0.85))
+            .position(labelPoint)
+    }
+}
+
+struct DialTicks: View {
+    let radius: CGFloat
+    let color: Color
+    var tickCount: Int = 180
+
+    var body: some View {
+        let step = 240.0 / Double(max(1, tickCount - 1))
+        ZStack {
+            ForEach(0..<tickCount, id: \.self) { i in
+                Rectangle()
+                    .fill(color.opacity(0.45))
+                    .frame(width: 2, height: 8)
+                    .offset(y: -radius)
+                    .rotationEffect(.degrees(Double(i) * step - 120))
+            }
+        }
+    }
+}
+
+struct DialMarker: View {
+    let radius: CGFloat
+    let angle: Angle
+    let color: Color
+    var length: CGFloat = 18
+
+    var body: some View {
+        Rectangle()
+            .fill(color)
+            .frame(width: 3, height: length)
+            .offset(y: -radius)
+            .rotationEffect(angle)
+    }
+}
+
+struct DialArc: Shape {
+    let start: Angle
+    let end: Angle
+
+    func path(in rect: CGRect) -> Path {
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        let radius = min(rect.width, rect.height) / 2
+        var p = Path()
+        p.addArc(
+            center: center,
+            radius: radius,
+            startAngle: start - .degrees(90),
+            endAngle: end - .degrees(90),
+            clockwise: false
+        )
+        return p
+    }
+}
+
+struct ControlIconButton: View {
+    let symbol: String
+    let label: String
+    let isActive: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                Image(systemName: symbol)
+                    .font(.system(size: 18, weight: .semibold))
+                Text(label)
+                    .font(.system(size: 11, weight: .semibold))
+            }
+            .foregroundStyle(isActive ? .white : .white.opacity(0.75))
+            .frame(width: 70, height: 54)
+            .background(
+                isActive ? Color.white.opacity(0.18) : Color.white.opacity(0.10),
+                in: RoundedRectangle(cornerRadius: 14)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct InfoRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.85))
+            Spacer()
+            Text(value)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.white)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 10)
+        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
+struct ModePickerSheet: View {
+    let title: String
+    let options: [DeviceDetailView.ModeOption]
+    let isActive: (String) -> Bool
+    let onSelect: (String) -> Void
+    @Environment(\.dismiss) var dismiss
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Text(title).font(.headline)
+            HStack(spacing: 10) {
+                ForEach(options, id: \.label) { m in
+                    Button {
+                        onSelect(m.nestMode)
+                        dismiss()
+                    } label: {
+                        VStack(spacing: 6) {
+                            Image(systemName: iconName(for: m.nestMode))
+                                .font(.system(size: 16, weight: .semibold))
+                            Text(m.label)
+                                .font(.system(size: 12, weight: .bold))
+                        }
+                        .frame(width: 64, height: 60)
+                        .background(
+                            isActive(m.nestMode) ? Color.white.opacity(0.22) : Color.white.opacity(0.12),
+                            in: RoundedRectangle(cornerRadius: 12)
+                        )
+                        .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    func iconName(for mode: String) -> String {
+        switch mode {
+        case "heat": return "flame.fill"
+        case "cool": return "snowflake"
+        case "range": return "dial.medium"
+        case "emergency": return "exclamationmark.triangle.fill"
+        default: return "powersleep"
+        }
+    }
+}
+
+struct FanPickerSheet: View {
+    let isOn: Bool
+    let onSelect: (Bool) -> Void
+    @Environment(\.dismiss) var dismiss
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Text("Fan").font(.headline)
+            HStack(spacing: 10) {
+                Button {
+                    onSelect(false)
+                    dismiss()
+                } label: {
+                    VStack(spacing: 6) {
+                        Image(systemName: "fan")
+                            .font(.system(size: 16, weight: .semibold))
+                        Text("Auto")
+                            .font(.system(size: 12, weight: .bold))
+                    }
+                    .frame(width: 64, height: 60)
+                    .background(
+                        !isOn ? Color.white.opacity(0.22) : Color.white.opacity(0.12),
+                        in: RoundedRectangle(cornerRadius: 12)
+                    )
+                    .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+                Button {
+                    onSelect(true)
+                    dismiss()
+                } label: {
+                    VStack(spacing: 6) {
+                        Image(systemName: "fan.fill")
+                            .font(.system(size: 16, weight: .semibold))
+                        Text("On")
+                            .font(.system(size: 12, weight: .bold))
+                    }
+                    .frame(width: 64, height: 60)
+                    .background(
+                        isOn ? Color.white.opacity(0.22) : Color.white.opacity(0.12),
+                        in: RoundedRectangle(cornerRadius: 12)
+                    )
+                    .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 }
 
